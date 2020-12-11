@@ -4,8 +4,6 @@ require_once(dirname($_SERVER['PHP_SELF'])."/TestSuite.php");
 
 class Redis_Test extends TestSuite
 {
-    const PORT = 6379;
-
     /* City lat/long */
     protected $cities = [
         'Chico'         => [-121.837478, 39.728494],
@@ -53,11 +51,54 @@ class Redis_Test extends TestSuite
         return round(microtime(true)*1000);
     }
 
+    protected function getAuthParts(&$user, &$pass) {
+        $user = $pass = NULL;
+
+        $auth = $this->getAuth();
+        if ( ! $auth)
+            return;
+
+        if (is_array($auth)) {
+            if (count($auth) > 1) {
+                list($user, $pass) = $auth;
+            } else {
+                $pass = $auth[0];
+            }
+        } else {
+            $pass = $auth;
+        }
+    }
+
+    protected function getAuthFragment() {
+        static $_authidx = 0;
+        $_authidx++;
+
+        $this->getAuthParts($user, $pass);
+
+        if ($user && $pass) {
+            if ($_authidx % 2 == 0)
+                return "auth[user]=$user&auth[pass]=$pass";
+            else
+                return "auth[]=$user&auth[]=$pass";
+        } else if ($pass) {
+            if ($_authidx % 3 == 0)
+                return "auth[pass]=$pass";
+            if ($_authidx % 2 == 0)
+                return "auth[]=$pass";
+            else
+                return "auth=$pass";
+        } else {
+            return NULL;
+        }
+    }
+
     protected function getFullHostPath()
     {
         $fullHostPath = parent::getFullHostPath();
-        if (isset($fullHostPath) && $this->getAuth()) {
-            $fullHostPath .= '?auth=' . $this->getAuth();
+        $authFragment = $this->getAuthFragment();
+
+        if (isset($fullHostPath) && $authFragment) {
+            $fullHostPath .= "?$authFragment";
         }
         return $fullHostPath;
     }
@@ -65,7 +106,7 @@ class Redis_Test extends TestSuite
     protected function newInstance() {
         $r = new Redis();
 
-        $r->connect($this->getHost(), self::PORT);
+        $r->connect($this->getHost(), $this->getPort());
 
         if($this->getAuth()) {
             $this->assertTrue($r->auth($this->getAuth()));
@@ -330,9 +371,14 @@ class Redis_Test extends TestSuite
         $this->assertEquals($this->redis->get('foo'), 'bar');
         $this->assertEquals($this->redis->ttl('foo'), 20);
 
+        /* Should coerce doubles into long */
+        $this->assertTrue($this->redis->set('foo', 'bar-20.5', 20.5));
+        $this->assertEquals($this->redis->ttl('foo'), 20);
+        $this->assertEquals($this->redis->get('foo'), 'bar-20.5');
+
         /* Invalid third arguments */
-        $this->assertFalse($this->redis->set('foo','bar','baz'));
-        $this->assertFalse($this->redis->set('foo','bar',new StdClass()));
+        $this->assertFalse(@$this->redis->set('foo','bar','baz'));
+        $this->assertFalse(@$this->redis->set('foo','bar',new StdClass()));
 
         /* Set if not exist */
         $this->redis->del('foo');
@@ -377,6 +423,25 @@ class Redis_Test extends TestSuite
         $this->redis->set('foo','bar', NULL);
         $this->assertEquals($this->redis->get('foo'), 'bar');
         $this->assertTrue($this->redis->ttl('foo')<0);
+
+        /* Make sure we ignore bad/non-string options (regression test for #1835) */
+        $this->assertTrue($this->redis->set('foo', 'bar', [NULL, 'EX' => 60]));
+        $this->assertTrue($this->redis->set('foo', 'bar', [NULL, new stdClass(), 'EX' => 60]));
+        $this->assertFalse(@$this->redis->set('foo', 'bar', [NULL, 'EX' => []]));
+
+        if (version_compare($this->version, "6.0.0") < 0)
+            return;
+
+        /* KEEPTTL works by itself */
+        $this->redis->set('foo', 'bar', ['EX' => 100]);
+        $this->redis->set('foo', 'bar', ['KEEPTTL']);
+        $this->assertTrue($this->redis->ttl('foo') > -1);
+
+        /* Works with other options */
+        $this->redis->set('foo', 'bar', ['XX', 'KEEPTTL']);
+        $this->assertTrue($this->redis->ttl('foo') > -1);
+        $this->redis->set('foo', 'bar', ['XX']);
+        $this->assertTrue($this->redis->ttl('foo') == -1);
     }
 
     public function testGetSet() {
@@ -875,8 +940,15 @@ class Redis_Test extends TestSuite
 
         // blocking blpop, brpop
         $this->redis->del('list');
-        $this->assertTrue($this->redis->blPop(['list'], 1) === []);
-        $this->assertTrue($this->redis->brPop(['list'], 1) === []);
+
+        /* Also test our option that we want *-1 to be returned as NULL */
+        foreach ([false => [], true => NULL] as $opt => $val) {
+            $this->redis->setOption(Redis::OPT_NULL_MULTIBULK_AS_NULL, $opt);
+            $this->assertEquals($val, $this->redis->blPop(['list'], 1));
+            $this->assertEquals($val, $this->redis->brPop(['list'], 1));
+        }
+
+        $this->redis->setOption(Redis::OPT_NULL_MULTIBULK_AS_NULL, false);
     }
 
     public function testllen()
@@ -4505,6 +4577,16 @@ class Redis_Test extends TestSuite
         $this->checkCompression(Redis::COMPRESSION_ZSTD, 9);
     }
 
+
+    public function testCompressionLZ4()
+    {
+        if (!defined('Redis::COMPRESSION_LZ4')) {
+            $this->markTestSkipped();
+        }
+        $this->checkCompression(Redis::COMPRESSION_LZ4, 0);
+        $this->checkCompression(Redis::COMPRESSION_LZ4, 9);
+    }
+
     private function checkCompression($mode, $level)
     {
         $this->assertTrue($this->redis->setOption(Redis::OPT_COMPRESSION, $mode) === TRUE);  // set ok
@@ -4516,6 +4598,18 @@ class Redis_Test extends TestSuite
         $val = 'xxxxxxxxxx';
         $this->redis->set('key', $val);
         $this->assertEquals($val, $this->redis->get('key'));
+
+        /* Empty data */
+        $this->redis->set('key', '');
+        $this->assertEquals('', $this->redis->get('key'));
+
+        /* Iterate through class sizes */
+        for ($i = 1; $i <= 65536; $i *= 2) {
+            foreach ([str_repeat('A', $i), random_bytes($i)] as $val) {
+                $this->redis->set('key', $val);
+                $this->assertEquals($val, $this->redis->get('key'));
+            }
+        }
     }
 
     public function testDumpRestore() {
@@ -4870,6 +4964,41 @@ class Redis_Test extends TestSuite
         $this->redis->setOption(Redis::OPT_REPLY_LITERAL, false);
     }
 
+    public function testNullArray() {
+        $key = "key:arr";
+        $this->redis->del($key);
+
+        foreach ([false => [], true => NULL] as $opt => $test) {
+            $this->redis->setOption(Redis::OPT_NULL_MULTIBULK_AS_NULL, $opt);
+
+            $r = $this->redis->rawCommand("BLPOP", $key, .05);
+            $this->assertEquals($test, $r);
+
+            $this->redis->multi();
+            $this->redis->rawCommand("BLPOP", $key, .05);
+            $r = $this->redis->exec();
+            $this->assertEquals([$test], $r);
+        }
+
+        $this->redis->setOption(Redis::OPT_NULL_MULTIBULK_AS_NULL, false);
+    }
+
+    /* Test that we can configure PhpRedis to return NULL for *-1 even nestedwithin replies */
+    public function testNestedNullArray() {
+        $this->redis->del('{notaset}');
+
+        foreach ([false => [], true => NULL] as $opt => $test) {
+            $this->redis->setOption(Redis::OPT_NULL_MULTIBULK_AS_NULL, $opt);
+            $this->assertEquals([$test, $test], $this->redis->geoPos('{notaset}', 'm1', 'm2'));
+
+            $this->redis->multi();
+            $this->redis->geoPos('{notaset}', 'm1', 'm2');
+            $this->assertEquals([[$test, $test]], $this->redis->exec());
+        }
+
+        $this->redis->setOption(Redis::OPT_NULL_MULTIBULK_AS_NULL, false);
+    }
+
     public function testReconnectSelect() {
         $key = 'reconnect-select';
         $value = 'Has been set!';
@@ -4922,7 +5051,7 @@ class Redis_Test extends TestSuite
     public function testIntrospection() {
         // Simple introspection tests
         $this->assertTrue($this->redis->getHost() === $this->getHost());
-        $this->assertTrue($this->redis->getPort() === self::PORT);
+        $this->assertTrue($this->redis->getPort() === $this->getPort());
         $this->assertTrue($this->redis->getAuth() === $this->getAuth());
     }
 
@@ -5399,7 +5528,6 @@ class Redis_Test extends TestSuite
                             $ret2 = $this->redis->$cmd('{gk}', $city, 500, 'mi', $realopts);
                         }
 
-                        if ($ret1 != $ret2) die();
                         $this->assertEquals($ret1, $ret2);
                     }
                 }
@@ -5961,6 +6089,147 @@ class Redis_Test extends TestSuite
             $this->assertTrue(array_key_exists($key, $info));
             $this->assertTrue(is_array($info[$key]));
         }
+
+        /* XINFO STREAM FULL [COUNT N] Requires >= 6.0.0 */
+        if (!$this->minVersionCheck("6.0"))
+            return;
+
+        /* Add some items to the stream so we can test COUNT */
+        for ($i = 0; $i < 5; $i++) {
+            $this->redis->xAdd($stream, '*', ['foo' => 'bar']);
+        }
+
+        $info = $this->redis->xInfo('STREAM', $stream, 'full');
+        $this->assertTrue(isset($info['groups']));
+
+        for ($count = 1; $count < 5; $count++) {
+            $info = $this->redis->xInfo('STREAM', $stream, 'full', $count);
+            $n = isset($info['entries']) ? count($info['entries']) : 0;
+            $this->assertEquals($n, $count);
+        }
+
+        /* Count <= 0 should be ignored */
+        foreach ([-1, 0] as $count) {
+            $info = $this->redis->xInfo('STREAM', $stream, 'full', 0);
+            $n = isset($info['entries']) ? count($info['entries']) : 0;
+            $this->assertEquals($n, $this->redis->xLen($stream));
+        }
+    }
+
+    /* Regression test for issue-1831 (XINFO STREAM on an empty stream) */
+    public function testXInfoEmptyStream() {
+        /* Configure an empty stream */
+        $this->redis->del('s');
+        $this->redis->xAdd('s', '*', ['foo' => 'bar']);
+        $this->redis->xTrim('s', 0);
+
+        $arr_info = $this->redis->xInfo('STREAM', 's');
+
+        $this->assertTrue(is_array($arr_info));
+        $this->assertEquals(0, $arr_info['length']);
+        $this->assertEquals(NULL, $arr_info['first-entry']);
+        $this->assertEquals(NULL, $arr_info['last-entry']);
+    }
+
+    public function testInvalidAuthArgs() {
+        $obj_new = $this->newInstance();
+
+        $arr_args = [
+            NULL,
+            [],
+            [NULL, NULL],
+            ['foo', 'bar', 'baz'],
+            ['a','b','c','d'],
+            ['a','b','c'],
+            [['a','b'], 'a'],
+            [['a','b','c']],
+            [[NULL, 'pass']],
+            [[NULL, NULL]],
+        ];
+
+        foreach ($arr_args as $arr_arg) {
+            try {
+                if (is_array($arr_arg)) {
+                    @call_user_func_array([$obj_new, 'auth'], $arr_arg);
+                } else {
+                    call_user_func([$obj_new, 'auth']);
+                }
+            } catch (Exception $ex) {
+                unset($ex); /* Suppress intellisense warning */
+            } catch (ArgumentCountError $ex) {
+                unset($ex); /* Suppress intellisense warning */
+            }
+        }
+    }
+
+    public function testAcl() {
+        if ( ! $this->minVersionCheck("6.0"))
+            return $this->markTestSkipped();
+
+        /* ACL USERS/SETUSER */
+        $this->assertTrue(in_array('default', $this->redis->acl('USERS')));
+        $this->assertTrue($this->redis->acl('SETUSER', 'admin', 'on', '>admin', '+@all'));
+        $this->assertTrue($this->redis->acl('SETUSER', 'noperm', 'on', '>noperm', '-@all'));
+        $this->assertInArray('default', $this->redis->acl('USERS'));
+
+        /* Verify ACL GETUSER has the correct hash and is in 'nice' format */
+        $arr_admin = $this->redis->acl('GETUSER', 'admin');
+        $this->assertInArray(hash('sha256', 'admin'), $arr_admin['passwords']);
+
+        /* Now nuke our 'admin' user and make sure it went away */
+        $this->assertTrue($this->redis->acl('DELUSER', 'admin'));
+        $this->assertTrue(!in_array('admin', $this->redis->acl('USERS')));
+
+        /* Try to log in with a bad username/password */
+        $this->assertThrowsMatch($this->redis,
+            function($o) { $o->auth(['1337haxx00r', 'lolwut']); }, '/^WRONGPASS.*$/');
+
+        /* We attempted a bad login.  We should have an ACL log entry */
+        $arr_log = $this->redis->acl('log');
+        if (! $arr_log || !is_array($arr_log)) {
+            $this->assertTrue(false);
+            return;
+        }
+
+        /* Make sure our ACL LOG entries are nice for the user */
+        $arr_entry = array_shift($arr_log);
+        $this->assertArrayKey($arr_entry, 'age-seconds', 'is_numeric');
+        $this->assertArrayKey($arr_entry, 'count', 'is_int');
+
+        /* ACL CAT */
+        $cats = $this->redis->acl('CAT');
+        foreach (['read', 'write', 'slow'] as $cat) {
+            $this->assertInArray($cat, $cats);
+        }
+
+        /* ACL CAT <string> */
+        $cats = $this->redis->acl('CAT', 'string');
+        foreach (['get', 'set', 'setnx'] as $cat) {
+            $this->assertInArray($cat, $cats);
+        }
+
+        /* ctype_xdigit even if PHP doesn't have it */
+        $ctype_xdigit = function($v) {
+            if (function_exists('ctype_xdigit')) {
+                return ctype_xdigit($v);
+            } else {
+                return strspn(strtoupper($v), '0123456789ABCDEF') == strlen($v);
+            }
+        };
+
+        /* ACL GENPASS/ACL GENPASS <bits> */
+        $this->assertValidate($this->redis->acl('GENPASS'), $ctype_xdigit);
+        $this->assertValidate($this->redis->acl('GENPASS', 1024), $ctype_xdigit);
+
+        /* ACL WHOAMI */
+        $this->assertValidate($this->redis->acl('WHOAMI'), 'strlen');
+
+        /* Finally make sure AUTH errors throw an exception */
+        $r2 = $this->newInstance(true);
+
+        /* Test NOPERM exception */
+        $this->assertTrue($r2->auth(['noperm', 'noperm']));
+        $this->assertThrowsMatch($r2, function($r) { $r->set('foo', 'bar'); }, '/^NOPERM.*$/');
     }
 
     /* If we detect a unix socket make sure we can connect to it in a variety of ways */
@@ -6219,6 +6488,21 @@ class Redis_Test extends TestSuite
             $redis->connect($host, 6379, 0.01);
         }  catch (Exception $e) {
             $this->assertTrue(strpos($e, "timed out") !== false);
+        }
+    }
+
+    public function testTlsConnect()
+    {
+        if (($fp = @fsockopen($this->getHost(), 6378)) == NULL)
+            return $this->markTestSkipped();
+
+        fclose($fp);
+
+        foreach (['localhost' => true, '127.0.0.1' => false] as $host => $verify) {
+            $redis = new Redis();
+            $this->assertTrue($redis->connect('tls://' . $host, 6378, 0, null, 0, 0, [
+                'stream' => ['verify_peer_name' => $verify, 'verify_peer' => false]
+            ]));
         }
     }
 

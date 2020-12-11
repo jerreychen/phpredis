@@ -129,6 +129,8 @@
     mc.kw     = keyword; \
     mc.kw_len = keyword_len; \
 
+#define CLUSTER_CACHING_ENABLED() (INI_INT("redis.clusters.cache_slots") == 1)
+
 /* Cluster redirection enum */
 typedef enum CLUSTER_REDIR_TYPE {
     REDIR_NONE,
@@ -183,14 +185,9 @@ typedef struct clusterFoldItem clusterFoldItem;
 
 /* RedisCluster implementation structure */
 typedef struct redisCluster {
-    zend_string *auth;
 
-    /* Timeout and read timeout (for normal operations) */
-    double timeout;
-    double read_timeout;
-
-    /* Are we using persistent connections */
-    int persistent;
+    /* One RedisSock struct for serialization and prefix information */
+    RedisSock *flags;
 
     /* How long in milliseconds should we wait when being bounced around */
     long waitms;
@@ -239,9 +236,6 @@ typedef struct redisCluster {
 
     /* The slot where we're subscribed */
     short subscribed_slot;
-
-    /* One RedisSock struct for serialization and prefix information */
-    RedisSock *flags;
 
     /* The first line of our last reply, not including our reply type byte
      * or the trailing \r\n */
@@ -331,14 +325,14 @@ typedef struct clusterReply {
     size_t integer;                /* Integer reply */
     long long len;                 /* Length of our string */
     char *str;                     /* String reply */
-    size_t elements;               /* Count of array elements */
+    long long elements;            /* Count of array elements */
     struct clusterReply **element; /* Array elements */
 } clusterReply;
 
 /* Direct variant response handler */
 clusterReply *cluster_read_resp(redisCluster *c, int status_strings);
 clusterReply *cluster_read_sock_resp(RedisSock *redis_sock,
-    REDIS_REPLY_TYPE type, char *line_reply, size_t reply_len);
+    REDIS_REPLY_TYPE type, char *line_reply, long long reply_len);
 void cluster_free_reply(clusterReply *reply, int free_data);
 
 /* Cluster distribution helpers for WATCH */
@@ -358,6 +352,15 @@ void cluster_multi_fini(clusterMultiCmd *mc);
 /* Hash a key to it's slot, using the Redis Cluster hash algorithm */
 unsigned short cluster_hash_key_zval(zval *key);
 unsigned short cluster_hash_key(const char *key, int len);
+
+/* Validate and sanitize cluster construction args */
+zend_string** cluster_validate_args(double timeout, double read_timeout, 
+    HashTable *seeds, uint32_t *nseeds, char **errstr);
+
+void free_seed_array(zend_string **seeds, uint32_t nseeds);
+
+/* Generate a unique hash string from seeds array */
+zend_string *cluster_hash_seeds(zend_string **seeds, uint32_t nseeds);
 
 /* Get the current time in milliseconds */
 long long mstime(void);
@@ -380,7 +383,7 @@ PHP_REDIS_API int cluster_send_slot(redisCluster *c, short slot, char *cmd,
 PHP_REDIS_API redisCluster *cluster_create(double timeout, double read_timeout,
     int failover, int persistent);
 PHP_REDIS_API void cluster_free(redisCluster *c, int free_ctx);
-PHP_REDIS_API int cluster_init_seeds(redisCluster *c, HashTable *ht_seeds);
+PHP_REDIS_API void cluster_init_seeds(redisCluster *c, zend_string **seeds, uint32_t nseeds);
 PHP_REDIS_API int cluster_map_keyspace(redisCluster *c);
 PHP_REDIS_API void cluster_free_node(redisClusterNode *node);
 
@@ -391,10 +394,10 @@ PHP_REDIS_API void cluster_init_cache(redisCluster *c, redisCachedCluster *rcc);
 
 /* Functions to facilitate cluster slot caching */
 
-PHP_REDIS_API char **cluster_sock_read_multibulk_reply(RedisSock *redis_sock,
-    int *len);
-PHP_REDIS_API int cluster_cache_store(HashTable *ht_seeds, HashTable *nodes);
-PHP_REDIS_API redisCachedCluster *cluster_cache_load(HashTable *ht_seeds);
+PHP_REDIS_API char **cluster_sock_read_multibulk_reply(RedisSock *redis_sock, int *len);
+
+PHP_REDIS_API int cluster_cache_store(zend_string *hash, HashTable *nodes);
+PHP_REDIS_API redisCachedCluster *cluster_cache_load(zend_string *hash);
 
 /*
  * Redis Cluster response handlers.  Our response handlers generally take the
@@ -487,6 +490,10 @@ PHP_REDIS_API void cluster_xclaim_resp(INTERNAL_FUNCTION_PARAMETERS,
     redisCluster *c, void *ctx);
 PHP_REDIS_API void cluster_xinfo_resp(INTERNAL_FUNCTION_PARAMETERS,
     redisCluster *c, void *ctx);
+
+/* Custom ACL handlers */
+PHP_REDIS_API void cluster_acl_getuser_resp(INTERNAL_FUNCTION_PARAMETERS, redisCluster *c, void *ctx);
+PHP_REDIS_API void cluster_acl_log_resp(INTERNAL_FUNCTION_PARAMETERS, redisCluster *c, void *ctx);
 
 /* MULTI BULK processing callbacks */
 int mbulk_resp_loop(RedisSock *redis_sock, zval *z_result,

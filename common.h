@@ -82,6 +82,7 @@ typedef enum _PUBSUB_TYPE {
 #define REDIS_OPT_COMPRESSION        7
 #define REDIS_OPT_REPLY_LITERAL      8
 #define REDIS_OPT_COMPRESSION_LEVEL  9
+#define REDIS_OPT_NULL_MBULK_AS_NULL 10
 
 /* cluster options */
 #define REDIS_FAILOVER_NONE              0
@@ -100,6 +101,7 @@ typedef enum {
 #define REDIS_COMPRESSION_NONE 0
 #define REDIS_COMPRESSION_LZF  1
 #define REDIS_COMPRESSION_ZSTD 2
+#define REDIS_COMPRESSION_LZ4  3
 
 /* SCAN options */
 #define REDIS_SCAN_NORETRY 0
@@ -209,18 +211,30 @@ typedef enum {
         REDIS_PROCESS_RESPONSE_CLOSURE(resp_func, ctx) \
     }
 
-/* Extended SET argument detection */
-#define IS_EX_ARG(a) \
-    ((a[0]=='e' || a[0]=='E') && (a[1]=='x' || a[1]=='X') && a[2]=='\0')
-#define IS_PX_ARG(a) \
-    ((a[0]=='p' || a[0]=='P') && (a[1]=='x' || a[1]=='X') && a[2]=='\0')
-#define IS_NX_ARG(a) \
-    ((a[0]=='n' || a[0]=='N') && (a[1]=='x' || a[1]=='X') && a[2]=='\0')
-#define IS_XX_ARG(a) \
-    ((a[0]=='x' || a[0]=='X') && (a[1]=='x' || a[1]=='X') && a[2]=='\0')
+/* Case sensitive compare against compile-time static string */
+#define REDIS_STRCMP_STATIC(s, len, sstr) \
+    (len == sizeof(sstr) - 1 && !strncmp(s, sstr, len))
 
-#define IS_EX_PX_ARG(a) (IS_EX_ARG(a) || IS_PX_ARG(a))
-#define IS_NX_XX_ARG(a) (IS_NX_ARG(a) || IS_XX_ARG(a))
+/* Case insensitive compare against compile-time static string */
+#define REDIS_STRICMP_STATIC(s, len, sstr) \
+    (len == sizeof(sstr) - 1 && !strncasecmp(s, sstr, len))
+
+/* Test if a zval is a string and (case insensitive) matches a static string */
+#define ZVAL_STRICMP_STATIC(zv, sstr) \
+    REDIS_STRICMP_STATIC(Z_STRVAL_P(zv), Z_STRLEN_P(zv), sstr)
+
+/* Case insensitive compare of a zend_string to a static string */
+#define ZSTR_STRICMP_STATIC(zs, sstr) \
+    REDIS_STRICMP_STATIC(ZSTR_VAL(zs), ZSTR_LEN(zs), sstr)
+
+/* Extended SET argument detection */
+#define ZSTR_IS_EX_ARG(zs) ZSTR_STRICMP_STATIC(zs, "EX")
+#define ZSTR_IS_PX_ARG(zs) ZSTR_STRICMP_STATIC(zs, "PX")
+#define ZSTR_IS_NX_ARG(zs) ZSTR_STRICMP_STATIC(zs, "NX")
+#define ZSTR_IS_XX_ARG(zs) ZSTR_STRICMP_STATIC(zs, "XX")
+
+#define ZVAL_IS_NX_XX_ARG(zv) (ZVAL_STRICMP_STATIC(zv, "NX") || ZVAL_STRICMP_STATIC(zv, "XX"))
+#define ZSTR_IS_EX_PX_ARG(a) (ZSTR_IS_EX_ARG(a) || ZSTR_IS_PX_ARG(a))
 
 /* Given a string and length, validate a zRangeByLex argument.  The semantics
  * here are that the argument must start with '(' or '[' or be just the char
@@ -250,38 +264,41 @@ typedef struct fold_item {
 
 /* {{{ struct RedisSock */
 typedef struct {
-    php_stream        *stream;
-    zend_string       *host;
-    int               port;
-    zend_string       *auth;
-    double            timeout;
-    double            read_timeout;
-    long              retry_interval;
-    redis_sock_status status;
-    int               persistent;
-    int               watching;
-    zend_string       *persistent_id;
+    php_stream         *stream;
+    php_stream_context *stream_ctx;
+    zend_string        *host;
+    int                port;
+    zend_string        *user;
+    zend_string        *pass;
+    double             timeout;
+    double             read_timeout;
+    long               retry_interval;
+    redis_sock_status  status;
+    int                persistent;
+    int                watching;
+    zend_string        *persistent_id;
 
-    redis_serializer  serializer;
-    int               compression;
-    int               compression_level;
-    long              dbNumber;
+    redis_serializer   serializer;
+    int                compression;
+    int                compression_level;
+    long               dbNumber;
 
-    zend_string       *prefix;
+    zend_string        *prefix;
 
-    short             mode;
-    fold_item         *head;
-    fold_item         *current;
+    short              mode;
+    fold_item          *head;
+    fold_item          *current;
 
-    zend_string       *pipeline_cmd;
+    zend_string        *pipeline_cmd;
 
-    zend_string       *err;
+    zend_string        *err;
 
-    int               scan;
+    int                scan;
 
-    int               readonly;
-    int               reply_literal;
-    int               tcp_keepalive;
+    int                readonly;
+    int                reply_literal;
+    int                null_mbulk_as_null;
+    int                tcp_keepalive;
 } RedisSock;
 /* }}} */
 
